@@ -96,8 +96,6 @@ function installSpotifyFedora() {
 
     mkdir -p "$SPOTIFY_INSTALL_PATH"
 
-    echo "$temp_dir"
-
     # Copy files to appropriate locations
     cp -r "$temp_dir/usr/"* "$SPOTIFY_INSTALL_PATH"
 
