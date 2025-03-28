@@ -1,8 +1,34 @@
 #!/usr/bin/env bash
 
+# Exit immediately if a command exits with a non-zero status
+set -e
+# Treat unset variables as an error when substituting
+set -u
+# Pipeline's return status is the value of the last (rightmost) command to exit with a non-zero status
+set -o pipefail
+
+# Detect if script is running in a pipe (non-interactive)
+if [ ! -t 0 ]; then
+    # Running non-interactively (e.g., curl | bash)
+    export NONINTERACTIVE=true
+else
+    export NONINTERACTIVE=false
+fi
+
+# Error handler function
+function error_handler() {
+    local line=$1
+    local cmd=$2
+    echo "Error on line $line: Command '$cmd' exited with status $?"
+    exit 1
+}
+
+# Set up the error trap
+trap 'error_handler ${LINENO} "$BASH_COMMAND"' ERR
+
 # Constants
-readonly SPOTIFY_INSTALL_PATH="$HOME/.local/share/spotify"
-readonly SPOTIFY_DEB_FILE="/tmp/spotify.deb"
+readonly SPOTIFY_INSTALL_PATH="$HOME/.local/spotify"
+readonly SPOTIFY_DOWNLOAD_DIR="/tmp"
 readonly SPOTIFY_DOWNLOAD_URL="https://repository.spotify.com/pool/non-free/s/spotify-client/"
 
 function printLogo() {
@@ -70,14 +96,18 @@ function installSpotifyFedora() {
 
     mkdir -p "$SPOTIFY_INSTALL_PATH"
 
+    echo "$temp_dir"
+
     # Copy files to appropriate locations
-    sudo cp -r "$temp_dir/usr" "$SPOTIFY_INSTALL_PATH"
+    cp -r "$temp_dir/usr/"* "$SPOTIFY_INSTALL_PATH"
 
     # symlink spotify to $HOME/.local/bin
-    sudo ln -s "$SPOTIFY_INSTALL_PATH/bin/spotify" "$HOME/.local/bin/spotify"
+    mkdir -p "$HOME/.local/bin"
+    ln -sf "$SPOTIFY_INSTALL_PATH/bin/spotify" "$HOME/.local/bin/spotify"
 
     # symlink spotify.desktop to $HOME/.local/share/applications
-    sudo ln -s "$SPOTIFY_INSTALL_PATH/share/spotify.desktop" "$HOME/.local/share/applications/spotify.desktop"
+    mkdir -p "$HOME/.local/share/applications"
+    ln -sf "$SPOTIFY_INSTALL_PATH/share/spotify/spotify.desktop" "$HOME/.local/share/applications/spotify.desktop"
 
     # Clean up
     rm -rf "$temp_dir"
@@ -87,12 +117,34 @@ function downloadSpotify() {
     local display_version="$1"
     local full_version="$2"
     local download_url="$SPOTIFY_DOWNLOAD_URL/spotify-client_${full_version}_amd64.deb"
-    local deb_file="$SPOTIFY_DEB_FILE"
+    local deb_file="${SPOTIFY_DOWNLOAD_DIR}/spotify-client_${full_version}_amd64.deb"
 
-    echo "Downloading Spotify version ${display_version}..."
+    # Check if file already exists and is valid
+    if [ -f "$deb_file" ]; then
+        echo "Found existing download for version ${display_version}." >&2
+        # Simple size check to verify it's not empty or corrupt
+        local file_size
+        file_size=$(stat -c%s "$deb_file")
+        if [ "$file_size" -gt 50000000 ]; then # 50MB minimum check
+            echo "Using existing download." >&2
+            echo "$deb_file"
+            return 0
+        else
+            echo "Existing file appears incomplete. Redownloading..." >&2
+            rm -f "$deb_file"
+        fi
+    fi
+
+    echo "Downloading Spotify version ${display_version}..." >&2
     if ! curl -L -o "$deb_file" "$download_url"; then
-        echo "Failed to download Spotify. Please check your internet connection."
-        return 1
+        echo "ERROR: Failed to download Spotify. Please check your internet connection." >&2
+        exit 1
+    fi
+
+    # Verify the file exists after download
+    if [ ! -f "$deb_file" ]; then
+        echo "ERROR: Download completed but file not found at $deb_file" >&2
+        exit 1
     fi
 
     echo "$deb_file"
@@ -109,23 +161,32 @@ function installSpotify() {
         installSpotifyFedora "$deb_file"
         ;;
     *)
-        echo "Your distribution is not supported yet."
-        rm "$deb_file"
-        return 1
+        echo "ERROR: Your distribution is not supported yet."
+        # Don't remove the file on error so download can be reused
+        exit 1
         ;;
     esac
 
-    rm "$deb_file"
-    echo "Spotify has been installed/updated successfully in $HOME/.local/share/spotify"
+    # Only remove file on successful install
+    rm -f "$deb_file"
+    echo "Spotify has been installed/updated successfully in $HOME/.local/spotify"
 }
 
 function downloadAndInstallSpotify() {
     local display_version="$1"
     local full_version="$2"
 
+    # Use a temporary file to store the path
+    local path_file="/tmp/spotify_path.tmp"
+    downloadSpotify "$display_version" "$full_version" >"$path_file"
     local deb_file
-    if ! deb_file=$(downloadSpotify "$display_version" "$full_version"); then
-        return 1
+    deb_file=$(cat "$path_file")
+    rm -f "$path_file"
+
+    # Verify we got a valid path back
+    if [ ! -f "$deb_file" ]; then
+        echo "ERROR: Failed to get valid Spotify package path: $deb_file"
+        exit 1
     fi
 
     installSpotify "$deb_file"
@@ -139,43 +200,67 @@ function main() {
     distro_type=$(getDistroType)
 
     if [ "$distro_type" == "unsupported" ]; then
-        echo "Your distribution is not supported yet."
-        return 1
+        echo "ERROR: Your distribution is not supported yet."
+        exit 1
     fi
 
     if isSpotifyInstalled; then
         echo "Spotify is installed."
         local current_version
         current_version=$(getSpotifyVersion)
+
+        if [ -z "$current_version" ]; then
+            echo "ERROR: Failed to determine Spotify version."
+            exit 1
+        fi
+
         echo "Current version: $current_version"
 
         echo "Checking for updates..."
         local display_version full_version
         read -r display_version full_version <<<"$(getLatestVersion)"
+
+        if [ -z "$display_version" ] || [ -z "$full_version" ]; then
+            echo "ERROR: Failed to fetch latest Spotify version."
+            exit 1
+        fi
+
         echo "Latest version: $display_version"
 
         if [[ "$current_version" == "$display_version" ]]; then
             echo "You have the latest version of Spotify."
         else
             echo "A newer version of Spotify is available."
-            read -p "Do you want to update? (y/n): " -n 1 -r
-            echo
-            if [[ $REPLY =~ ^[Yy]$ ]]; then
+            if [ "$NONINTERACTIVE" = true ]; then
+                echo "Running in non-interactive mode. Installing update automatically."
                 downloadAndInstallSpotify "$display_version" "$full_version"
             else
-                echo "Update canceled."
+                read -p "Do you want to update? (y/n): " -n 1 -r
+                echo
+                if [[ $REPLY =~ ^[Yy]$ ]]; then
+                    downloadAndInstallSpotify "$display_version" "$full_version"
+                else
+                    echo "Update canceled."
+                fi
             fi
         fi
     else
         echo "Spotify is not installed."
-        read -p "Do you want to install Spotify? (y/n): " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
+        if [ "$NONINTERACTIVE" = true ]; then
+            echo "Running in non-interactive mode. Installing Spotify automatically."
             local display_version full_version
             read -r display_version full_version <<<"$(getLatestVersion)"
             downloadAndInstallSpotify "$display_version" "$full_version"
         else
-            echo "Installation canceled."
+            read -p "Do you want to install Spotify? (y/n): " -n 1 -r
+            echo
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                local display_version full_version
+                read -r display_version full_version <<<"$(getLatestVersion)"
+                downloadAndInstallSpotify "$display_version" "$full_version"
+            else
+                echo "Installation canceled."
+            fi
         fi
     fi
 }
